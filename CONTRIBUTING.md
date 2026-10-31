@@ -1,5 +1,5 @@
 # Contributing
-
+>We highly recommend usage of our tooling. (documented down below)
 ## Scope
 
 - `scripts/<name>/`: standalone tools that talk to SwayFX over the IPC socket.
