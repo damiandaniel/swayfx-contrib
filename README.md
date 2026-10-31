@@ -10,6 +10,7 @@ This repository is not covered by upstream support. Report problems here, not in
 | --- | --- |
 | `scripts/<name>/` | External tools (IPC scripts, helpers). No SwayFX source needed. |
 | `patches/<name>/` | Compositor patch series against SwayFX. |
+| `tools/` | The `contrib` command: create and update tools, open pull requests, apply patches. |
 | `configs/` | Example configuration snippets. |
 | `docs/` | Guides and policies. |
 | `packaging/` | Package recipes, added on demand. |
@@ -17,17 +18,15 @@ This repository is not covered by upstream support. Report problems here, not in
 ## Index
 
 <!-- index:start -->
-| Name | Type | Description | Maintainer | Tested on | Status |
-| --- | --- | --- | --- | --- | --- |
-| [test-patch](patches/test-patch) | patch | Dummy patch for testing the repository automation. | @damiandaniel | 0.6 | active |
+No entries yet.
 <!-- index:end -->
 
 ## Using a patch
 
+This clones SwayFX, checks out the version the patch was tested on, and applies it on a new branch:
+
 ```
-git clone https://github.com/wlrfx/swayfx && cd swayfx
-git checkout <tag from the patch manifest>
-git am --3way /path/to/swayfx-contrib/patches/<name>/*.patch
+tools/contrib apply-patch <name>
 ```
 
 ## Contributing

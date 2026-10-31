@@ -34,7 +34,7 @@ dependencies = ["python3"]
 ```
 
 - `status`: `active` or `unmaintained`.
-- `language` and `dependencies`: required for scripts, optional for patches.
+- `language` and `dependencies` (a list, may be empty): required for scripts, optional for patches.
 - `swayfx_tested`: a SwayFX tag or commit.
 
 ## Patches
@@ -52,6 +52,27 @@ git config core.hooksPath .githooks
 ```
 
 Requires Python 3.11 or newer. Never edit the table between the index markers by hand.
+
+## Tooling
+
+`tools/contrib` creates tools in the correct structure, puts them on their own branch, and helps open the pull request. It needs Python 3.11 or newer and git. `origin` must be a repository you can push to, normally your fork.
+
+```
+tools/contrib create-patch <patch files or directory>
+tools/contrib create-script <file or directory>
+tools/contrib update-patch <name> <patch files or directory>
+tools/contrib adopt <name>
+tools/contrib apply-patch <name>...
+tools/contrib list
+```
+
+- `create-patch` and `create-script` ask for name, description, maintainer, SwayFX version (and language and dependencies for scripts), each on its own line. Every answer can also be passed as an option, for example `--name` or `--description`.
+- They create `patches/<name>` or `scripts/<name>` with `manifest.toml` and `README.md`, add the `CODEOWNERS` entry, regenerate and validate the index, and commit with a sign-off on a new branch (`add-patch/<name>`, `add-script/<name>`). Then they offer to push and open the pull request, with the template already filled in. Use `--push` to skip the question and `--no-git` to only write files.
+- Patches must be made with `git format-patch` from signed-off commits. `create-patch` checks this and verifies that the series applies on the SwayFX version you name. Use `--no-verify` to skip the apply check.
+- `update-patch` replaces the patch files of your tool and the tested version, on a branch `update-patch/<name>`.
+- `adopt` makes you the maintainer of an unmaintained tool, on a branch `adopt/<name>`.
+- `apply-patch` clones SwayFX, checks out the version the patch was tested on, and applies it on a branch `contrib/<name>`. `--base latest`, `--base head`, or `--base <ref>` selects another version, and `--dir` sets the target. If it does not apply, nothing is left behind.
+- The maintainer default comes from `git config github.user`. Set `SWAYFX_UPSTREAM` to use another SwayFX repository.
 
 ## Pull requests
 
