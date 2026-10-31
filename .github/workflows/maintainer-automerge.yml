@@ -5,6 +5,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 jobs:
   evaluate:
     if: github.event.pull_request.draft == false
@@ -19,29 +20,138 @@ jobs:
           BASE: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
-          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" \
+
+          marker='<!-- maintainer-automerge -->'
+          bt=$'\x60'
+          max_listed=30
+          all_labels=(NEW nCO nAUTH MANIFEST)
+          declare -A color=([NEW]=0e8a16 [nCO]=fbca04 [nAUTH]=d93f0b [MANIFEST]=1d76db)
+          declare -A explain=(
+            [NEW]="Adds a new patch or script. New tools always need human review."
+            [nCO]="Changes files that are not tool content. Only files inside patches/<name>/ or scripts/<name>/ can be auto-merged. Move other changes (root README, workflows, docs) into a separate PR."
+            [nAUTH]="The PR author is not the maintainer of the touched tool. Only the maintainer listed in its manifest.toml can auto-merge changes to it."
+            [MANIFEST]="Changes a manifest.toml. Manifests define maintainers and metadata, so these changes always need human review."
+          )
+
+          raw_files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" \
             --jq '.[] | .filename, (.previous_filename // empty)')
+
+          declare -A seen=()
+          declare -A detail=()
+          declare -A filetags=()
+          declare -A dirtags=()
           declare -A dirs=()
-          ok=1
+          declare -A flags=()
+          flist=()
+
+          add_detail() {
+            detail[$1]+="${detail[$1]:+, }${bt}$2${bt}$3"
+          }
+
           while IFS= read -r f; do
-            if [[ "$f" =~ ^(patches|scripts)/([^/]+)/(.+)$ ]] \
-               && [[ "${BASH_REMATCH[3]}" != "manifest.toml" ]]; then
+            [ -n "$f" ] || continue
+            [ -z "${seen[$f]:-}" ] || continue
+            seen[$f]=1
+            flist+=("$f")
+            safe=${f//"$bt"/"'"}
+            if [[ "$f" =~ ^(patches|scripts)/([^/]+)/(.+)$ ]]; then
               dirs["${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"]=1
+              if [ "${BASH_REMATCH[3]}" = "manifest.toml" ]; then
+                flags[MANIFEST]=1
+                filetags[$f]+="${filetags[$f]:+, }MANIFEST"
+                add_detail MANIFEST "$safe" ""
+              fi
             else
-              ok=0
+              flags[nCO]=1
+              filetags[$f]+="${filetags[$f]:+, }nCO"
+              add_detail nCO "$safe" ""
             fi
-          done <<< "$files"
-          [ "${#dirs[@]}" -gt 0 ] || ok=0
+          done <<< "$raw_files"
+
+          if [ "${#flist[@]}" -eq 0 ]; then
+            flags[nCO]=1
+            detail[nCO]="no changed files found"
+          fi
+
           for d in "${!dirs[@]}"; do
-            maint=$(gh api "repos/$REPO/contents/$d/manifest.toml?ref=$BASE" --jq .content 2>/dev/null \
-              | base64 -d \
-              | python3 -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read()).get("maintainer",""))' \
-              2>/dev/null || true)
-            if [ -z "$maint" ] || [ "${maint,,}" != "${AUTHOR,,}" ]; then
-              ok=0
+            safe=${d//"$bt"/"'"}
+            if raw=$(gh api "repos/$REPO/contents/$d/manifest.toml?ref=$BASE" --jq .content 2>/dev/null); then
+              maint=$(printf '%s' "$raw" | base64 -d \
+                | python3 -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read()).get("maintainer",""))' \
+                2>/dev/null || true)
+              if [ -z "$maint" ] || [ "${maint,,}" != "${AUTHOR,,}" ]; then
+                flags[nAUTH]=1
+                dirtags[$d]="nAUTH"
+                add_detail nAUTH "$safe" " (maintainer: ${bt}${maint:-unknown}${bt}, author: ${bt}${AUTHOR}${bt})"
+              fi
+            else
+              flags[NEW]=1
+              dirtags[$d]="NEW"
+              add_detail NEW "$safe" ""
             fi
           done
-          if [ "$ok" -eq 1 ]; then
+
+          current=$(gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name' || true)
+          for l in "${all_labels[@]}"; do
+            if [ -n "${flags[$l]:-}" ]; then
+              gh label create "$l" --repo "$REPO" --color "${color[$l]}" --force >/dev/null
+              gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$l" >/dev/null
+            elif grep -qx "$l" <<< "$current"; then
+              gh api -X DELETE "repos/$REPO/issues/$PR/labels/$l" >/dev/null
+            fi
+          done
+
+          comment_id=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq ".[] | select(.body | contains(\"$marker\")) | .id" | sed -n '1p' || true)
+
+          post() {
+            if [ -n "$comment_id" ]; then
+              gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" -f body="$1" >/dev/null
+            else
+              gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$1" >/dev/null
+            fi
+          }
+
+          if [ "${#flags[@]}" -eq 0 ]; then
             gh pr review "$PR" --repo "$REPO" --approve
             gh pr merge "$PR" --repo "$REPO" --auto --squash
+            if [ -n "$comment_id" ]; then
+              post "$marker"$'\n'"This PR now qualifies for auto-merge. It will merge once all required checks pass."
+            fi
+            exit 0
           fi
+
+          gh pr merge "$PR" --repo "$REPO" --disable-auto >/dev/null 2>&1 || true
+
+          joined=""
+          body="$marker"$'\n'"This PR cannot be auto-merged. It will be passed on for human review."$'\n\n'"Reasons:"$'\n'
+          for l in "${all_labels[@]}"; do
+            if [ -n "${flags[$l]:-}" ]; then
+              body+="- **$l**: ${explain[$l]}"$'\n'"  Affected: ${detail[$l]}"$'\n'
+              joined+="${joined:+, }$l"
+            fi
+          done
+
+          body+=$'\n'"Changed files (${#flist[@]}):"$'\n'
+          n=0
+          for f in "${flist[@]}"; do
+            n=$((n + 1))
+            if [ "$n" -gt "$max_listed" ]; then
+              continue
+            fi
+            safe=${f//"$bt"/"'"}
+            tags="${filetags[$f]:-}"
+            if [[ "$f" =~ ^(patches|scripts)/([^/]+)/ ]]; then
+              dt="${dirtags[${BASH_REMATCH[1]}/${BASH_REMATCH[2]}]:-}"
+              if [ -n "$dt" ]; then
+                tags+="${tags:+, }$dt"
+              fi
+            fi
+            body+="- ${bt}${safe}${bt}${tags:+ ($tags)}"$'\n'
+          done
+          if [ "$n" -gt "$max_listed" ]; then
+            body+="- and $((n - max_listed)) more"$'\n'
+          fi
+
+          body+=$'\n'"Applying tag: $joined"
+          post "$body"
