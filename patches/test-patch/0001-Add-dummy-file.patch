@@ -1,0 +1,21 @@
+From 5cf63d4c8d60f1ec3121b6aa10fa46370dfdf9ad Mon Sep 17 00:00:00 2001
+From: Damian Daniel <damian@danielovci.net>
+Date: Sat, 31 Oct 2026 21:36:03 +0100
+Subject: [PATCH] Add dummy file
+
+Signed-off-by: Damian Daniel <damian@danielovci.net>
+---
+ CONTRIB_TEST.txt | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 CONTRIB_TEST.txt
+
+diff --git a/CONTRIB_TEST.txt b/CONTRIB_TEST.txt
+new file mode 100644
+index 00000000..9daeafb9
+--- /dev/null
++++ b/CONTRIB_TEST.txt
+@@ -0,0 +1 @@
++test
+-- 
+2.55.0
+

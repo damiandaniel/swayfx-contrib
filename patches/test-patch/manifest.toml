@@ -1,0 +1,5 @@
+name = "test-patch"
+maintainer = "damiandaniel"
+description = "Dummy patch for testing the repository automation."
+swayfx_tested = "0.6"
+status = "active"
