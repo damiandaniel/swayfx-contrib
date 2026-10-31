@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+import urllib.parse
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+UPSTREAM = os.environ.get("SWAYFX_UPSTREAM", "https://github.com/wlrfx/swayfx")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+HANDLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
+KEY_ORDER = ["name", "description", "maintainer", "swayfx_tested", "status", "language", "dependencies"]
+EXTENSIONS = {".py": "python", ".sh": "shell", ".bash": "shell", ".lua": "lua", ".js": "javascript", ".rs": "rust"}
+SKIP_PARTS = {".git", "__pycache__"}
+
+
+class Fail(Exception):
+    pass
+
+
+def run(args, cwd=None, check=True):
+    p = subprocess.run([str(a) for a in args], cwd=cwd, text=True, capture_output=True)
+    if check and p.returncode != 0:
+        raise Fail(f"{' '.join(str(a) for a in args)}\n{(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def git(repo, *args, check=True):
+    return run(["git", "-C", repo, *args], check=check)
+
+
+def rgit(*args, check=True):
+    return git(ROOT, *args, check=check)
+
+
+def slugify(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def prompt(label, default=None, given=None, check=None, required=True):
+    if given is not None:
+        value = given.strip()
+        if check:
+            check(value)
+        return value
+    hint = f" [{default}]" if default else ""
+    while True:
+        try:
+            value = input(f"{label}{hint}: ").strip()
+        except EOFError:
+            raise Fail(f"input needed for '{label}': run in a terminal or pass the matching option")
+        value = value or (default or "")
+        if not value and required:
+            print("required")
+            continue
+        if value and check:
+            try:
+                check(value)
+            except Fail as e:
+                print(e)
+                continue
+        return value
+
+
+def confirm(label):
+    try:
+        return input(f"{label} [y/N]: ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def check_handle(value):
+    if not HANDLE_RE.fullmatch(value.lstrip("@")):
+        raise Fail("a GitHub handle contains only letters, digits and hyphens")
+
+
+def check_new_name(kind):
+    def check(value):
+        if not NAME_RE.fullmatch(value):
+            raise Fail("use lowercase letters, digits and hyphens")
+        if (ROOT / kind / value).exists():
+            raise Fail(f"{kind}/{value} already exists")
+    return check
+
+
+def git_user():
+    return run(["git", "config", "--get", "github.user"], check=False).stdout.strip() or None
+
+
+def latest_upstream_tag():
+    p = run(["git", "ls-remote", "--tags", "--refs", "--sort=-v:refname", UPSTREAM], check=False)
+    for line in p.stdout.splitlines():
+        return line.split("\t")[1].removeprefix("refs/tags/")
+    return None
+
+
+def dump_manifest(data):
+    lines = []
+    for key in KEY_ORDER:
+        if key not in data:
+            continue
+        value = data[key]
+        if isinstance(value, list):
+            lines.append(f"{key} = [{', '.join(json.dumps(v) for v in value)}]")
+        else:
+            lines.append(f"{key} = {json.dumps(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def load_manifest(directory):
+    return tomllib.loads((directory / "manifest.toml").read_text())
+
+
+def set_codeowner(kind, name, maintainer):
+    path = ROOT / ".github" / "CODEOWNERS"
+    prefix = f"/{kind}/{name}/"
+    entry = f"{prefix} @{maintainer}"
+    lines = path.read_text().splitlines()
+    replaced = False
+    for i, line in enumerate(lines):
+        if line.startswith(prefix + " "):
+            lines[i] = entry
+            replaced = True
+    if not replaced:
+        lines.append(entry)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def regenerate_and_validate():
+    run(["python3", ROOT / ".github/scripts/generate_index.py"], cwd=ROOT)
+    p = run(["python3", ROOT / ".github/scripts/validate.py"], cwd=ROOT, check=False)
+    if p.returncode != 0:
+        raise Fail("validation failed:\n" + p.stdout.strip())
+
+
+def default_branch():
+    p = rgit("symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+    if p.returncode == 0 and "/" in p.stdout.strip():
+        return p.stdout.strip().split("/", 1)[1]
+    for candidate in ("main", "master"):
+        for ref in (f"refs/heads/{candidate}", f"refs/remotes/origin/{candidate}"):
+            if rgit("rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0:
+                return candidate
+    return rgit("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+
+
+def base_ref():
+    d = default_branch()
+    for ref in (f"refs/remotes/origin/{d}", f"refs/heads/{d}"):
+        if rgit("rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0:
+            return ref
+    return "HEAD"
+
+
+class Branch:
+    def __init__(self, name, enabled):
+        self.name = name
+        self.enabled = enabled
+        self.created = []
+        self.snapshots = {}
+        self.abbrev = None
+        self.previous = None
+
+    def snapshot(self, *paths):
+        for path in paths:
+            if path.is_file() and path not in self.snapshots:
+                self.snapshots[path] = path.read_bytes()
+
+    def precheck(self):
+        if not self.enabled:
+            return
+        if rgit("rev-parse", "--git-dir", check=False).returncode != 0:
+            raise Fail("not a git repository: pass --no-git to only write the files")
+        if rgit("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            raise Fail("uncommitted changes in the repository: commit or stash them first, or pass --no-git")
+        if rgit("rev-parse", "--verify", "--quiet", f"refs/heads/{self.name}", check=False).returncode == 0:
+            raise Fail(f"branch {self.name} already exists: delete it or finish the earlier attempt")
+
+    def __enter__(self):
+        if not self.enabled:
+            self.snapshot(ROOT / ".github" / "CODEOWNERS", ROOT / "README.md")
+            return self
+        self.precheck()
+        rgit("fetch", "--quiet", "origin", check=False)
+        self.abbrev = rgit("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        sha = rgit("rev-parse", "HEAD").stdout.strip()
+        self.previous = sha if self.abbrev == "HEAD" else self.abbrev
+        rgit("switch", "--no-track", "-c", self.name, base_ref())
+        self.snapshot(ROOT / ".github" / "CODEOWNERS", ROOT / "README.md")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            return False
+        if self.enabled and self.previous is not None:
+            rgit("reset", "--hard", check=False)
+        for path in self.created:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink()
+        for path, data in self.snapshots.items():
+            path.write_bytes(data)
+        if self.enabled and self.previous is not None:
+            rgit("switch", *(["--detach"] if self.abbrev == "HEAD" else []), self.previous, check=False)
+            rgit("branch", "-D", self.name, check=False)
+        return False
+
+
+def commit(paths, message):
+    rgit("add", "--", *paths)
+    run(["git", "-C", ROOT, "commit", "-s", "-q", "-m", message])
+    return rgit("rev-parse", "--short", "HEAD").stdout.strip()
+
+
+def fill_template(path, replacements, checked):
+    if not path.is_file():
+        return ""
+    text = path.read_text()
+    for pattern, value in replacements:
+        text = re.sub(pattern, lambda m, v=value: v, text, count=1, flags=re.M)
+    lines = []
+    for line in text.splitlines():
+        m = re.match(r"- \[ \] (.*)$", line)
+        if m and any(m.group(1).startswith(c) for c in checked):
+            line = "- [x] " + m.group(1)
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def web_url(branch, default, title, template):
+    remote = rgit("remote", "get-url", "origin", check=False).stdout.strip()
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", remote)
+    if not m:
+        return None
+    query = {"quick_pull": "1", "title": title}
+    if template:
+        query["template"] = template
+    return f"https://github.com/{m.group(1)}/compare/{default}...{urllib.parse.quote(branch, safe='/')}?{urllib.parse.urlencode(query)}"
+
+
+def contribute(branch, title, body, template, push_now):
+    default = default_branch()
+    url = web_url(branch, default, title, template)
+    gh = shutil.which("gh")
+    print(f"\nbranch {branch} is ready with one commit. To contribute it:\n")
+    print(f"  git push -u origin {branch}")
+    if gh:
+        print(f"  gh pr create --base {default} --fill")
+    if url:
+        print(f"  or open: {url}")
+    print("\nA maintainer reviews the pull request. Changes to your own tool later are merged automatically.")
+    if not (push_now or confirm("\nPush and open the pull request now?")):
+        return 0
+    p = subprocess.run(["git", "-C", str(ROOT), "push", "-u", "origin", branch])
+    if p.returncode != 0:
+        raise Fail("push failed: check that origin points to a repository you can push to (your fork)")
+    if gh and body:
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+            f.write(body)
+        subprocess.run(["gh", "pr", "create", "--title", title, "--body-file", f.name, "--base", default], cwd=ROOT)
+        os.unlink(f.name)
+    elif url:
+        print(f"\nopen the pull request: {url}")
+    return 0
+
+
+def check_patch_file(f):
+    text = f.read_text(errors="replace")
+    if not text.startswith("From "):
+        raise Fail(f"{f.name} is not in git format-patch format: create it with 'git format-patch -1' from a commit")
+    if not re.search(r"^Signed-off-by: .+", text, re.M):
+        raise Fail(f"{f.name} has no Signed-off-by line: recreate it from a commit made with 'git commit -s'")
+    if run(["git", "apply", "--numstat", f], cwd=ROOT, check=False).returncode != 0:
+        raise Fail(f"{f.name} does not contain a valid diff")
+
+
+def collect_patches(paths):
+    files = []
+    for raw in paths:
+        p = Path(raw).expanduser()
+        if p.is_dir():
+            files += sorted(p.glob("*.patch"))
+        elif p.is_file():
+            files.append(p)
+        else:
+            raise Fail(f"{raw} not found")
+    if not files:
+        raise Fail("no patch files found")
+    for f in files:
+        check_patch_file(f)
+    return files
+
+
+def series_names(files):
+    out = []
+    for i, f in enumerate(files, 1):
+        stem = slugify(re.sub(r"^\d+-", "", f.stem)) or "patch"
+        out.append((f, f"{i:04d}-{stem}.patch"))
+    return out
+
+
+def write_series(dest, files, created):
+    for src, new in series_names(files):
+        target = dest / new
+        shutil.copy2(src, target)
+        created.append(target)
+
+
+def verify(files, tested):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        src = tmp / "src"
+        p = run(["git", "clone", "--quiet", "--depth", "1", "--branch", tested, UPSTREAM, src], check=False)
+        if p.returncode != 0:
+            print(f"note: could not fetch {tested} from {UPSTREAM}, skipping the apply check")
+            return False
+        p = run(
+            ["git", "-C", src, "-c", "user.name=contrib", "-c", "user.email=contrib@localhost", "am", "--3way", *files],
+            check=False,
+        )
+        if p.returncode != 0:
+            raise Fail(f"the patch does not apply on {tested}:\n{(p.stderr or p.stdout).strip()}\nrebase it onto {tested}, or pass --no-verify")
+        print(f"verified: applies on {tested}")
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def readme_patch(name, description, tested):
+    return (
+        f"# {name}\n\n{description}\n\nMade against SwayFX {tested}.\n\n"
+        f"## Apply\n\n```\ntools/contrib apply-patch {name}\n```\n\n## Notes\n\n"
+    )
+
+
+def readme_script(name, description, deps):
+    requirements = "".join(f"- {d}\n" for d in deps) or "- none\n"
+    return f"# {name}\n\n{description}\n\n## Requirements\n\n{requirements}\n## Usage\n\n"
+
+
+def cmd_create_patch(args):
+    files = collect_patches(args.files)
+    first = Path(args.files[0])
+    default_name = slugify(re.sub(r"^\d+-", "", first.name if first.is_dir() else first.stem))
+    name = prompt("Name", default_name, args.name, check_new_name("patches"))
+    use_git = not args.no_git
+    branch = Branch(f"add-patch/{name}", use_git)
+    branch.precheck()
+    description = prompt("Description (one line)", None, args.description)
+    maintainer = prompt("Maintainer (GitHub handle)", git_user(), args.maintainer, check_handle).lstrip("@")
+    tested = prompt("SwayFX version it was made against (tag or commit)", latest_upstream_tag(), args.tested)
+    verified = False if args.no_verify else verify(files, tested)
+    dest = ROOT / "patches" / name
+    with branch:
+        dest.mkdir(parents=True)
+        branch.created.append(dest)
+        write_series(dest, files, branch.created)
+        manifest = {"name": name, "description": description, "maintainer": maintainer, "swayfx_tested": tested, "status": "active"}
+        (dest / "manifest.toml").write_text(dump_manifest(manifest))
+        (dest / "README.md").write_text(readme_patch(name, description, tested))
+        set_codeowner("patches", name, maintainer)
+        regenerate_and_validate()
+        if use_git:
+            sha = commit(["patches/" + name, ".github/CODEOWNERS", "README.md"], f"Add patch {name}\n\n{description}")
+    print(f"created patches/{name} ({len(files)} patch file(s))")
+    if not use_git:
+        print("files written, nothing committed (--no-git)")
+        return 0
+    checked = ["Directory contains", "Entry added", "README index regenerated", "License is MIT", "Commits are signed off"]
+    if verified:
+        checked += ["Tested against", "Patches apply"]
+    body = fill_template(
+        ROOT / ".github/PULL_REQUEST_TEMPLATE/new-tool.md",
+        [
+            (r"^Name:.*$", f"Name: {name}"),
+            (r"^Type:.*$", "Type: patch"),
+            (r"^Maintainer \(GitHub handle\):.*$", f"Maintainer (GitHub handle): @{maintainer}"),
+            (r"^## What it does$", f"## What it does\n\n{description}"),
+        ],
+        checked,
+    )
+    return contribute(branch.name, f"Add patch {name}", body, "new-tool.md", args.push)
+
+
+def collect_script(raw):
+    p = Path(raw).expanduser().resolve()
+    if p.is_file():
+        return [(p, Path(p.name))]
+    if p.is_dir():
+        items = []
+        for f in sorted(p.rglob("*")):
+            rel = f.relative_to(p)
+            if f.is_file() and not (set(rel.parts) & SKIP_PARTS):
+                items.append((f, rel))
+        if not items:
+            raise Fail(f"{raw} contains no files")
+        return items
+    raise Fail(f"{raw} not found")
+
+
+def detect_language(items):
+    for src, _ in items:
+        if src.suffix in EXTENSIONS:
+            return EXTENSIONS[src.suffix]
+    first_line = items[0][0].read_text(errors="replace").splitlines()[:1]
+    if first_line and first_line[0].startswith("#!"):
+        if "python" in first_line[0]:
+            return "python"
+        if re.search(r"\b(ba)?sh\b", first_line[0]):
+            return "shell"
+    return None
+
+
+def cmd_create_script(args):
+    items = collect_script(args.path)
+    rels = {str(rel) for _, rel in items}
+    if "manifest.toml" in rels:
+        raise Fail("the input contains a manifest.toml: it is generated, remove it from the input")
+    p = Path(args.path)
+    default_name = slugify(p.name if p.is_dir() else p.stem)
+    name = prompt("Name", default_name, args.name, check_new_name("scripts"))
+    use_git = not args.no_git
+    branch = Branch(f"add-script/{name}", use_git)
+    branch.precheck()
+    description = prompt("Description (one line)", None, args.description)
+    maintainer = prompt("Maintainer (GitHub handle)", git_user(), args.maintainer, check_handle).lstrip("@")
+    tested = prompt("SwayFX version it was tested with (tag or commit)", latest_upstream_tag(), args.tested)
+    language = prompt("Language", detect_language(items), args.language)
+    raw_deps = prompt("Dependencies (comma separated, empty for none)", None, args.depends, required=False)
+    deps = [d.strip() for d in raw_deps.split(",") if d.strip()]
+    dest = ROOT / "scripts" / name
+    with branch:
+        dest.mkdir(parents=True)
+        branch.created.append(dest)
+        for src, rel in items:
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+        manifest = {
+            "name": name,
+            "description": description,
+            "maintainer": maintainer,
+            "swayfx_tested": tested,
+            "status": "active",
+            "language": language,
+            "dependencies": deps,
+        }
+        (dest / "manifest.toml").write_text(dump_manifest(manifest))
+        if "README.md" not in rels:
+            (dest / "README.md").write_text(readme_script(name, description, deps))
+        set_codeowner("scripts", name, maintainer)
+        regenerate_and_validate()
+        if use_git:
+            commit(["scripts/" + name, ".github/CODEOWNERS", "README.md"], f"Add script {name}\n\n{description}")
+    print(f"created scripts/{name} ({len(items)} file(s))")
+    if "README.md" in rels:
+        print("kept the README.md from your input")
+    if any(str(rel).endswith(".sh") for _, rel in items):
+        print("note: CI runs shellcheck on .sh files")
+    if not use_git:
+        print("files written, nothing committed (--no-git)")
+        return 0
+    body = fill_template(
+        ROOT / ".github/PULL_REQUEST_TEMPLATE/new-tool.md",
+        [
+            (r"^Name:.*$", f"Name: {name}"),
+            (r"^Type:.*$", "Type: script"),
+            (r"^Maintainer \(GitHub handle\):.*$", f"Maintainer (GitHub handle): @{maintainer}"),
+            (r"^## What it does$", f"## What it does\n\n{description}"),
+        ],
+        ["Directory contains", "Entry added", "README index regenerated", "License is MIT", "Commits are signed off"],
+    )
+    return contribute(branch.name, f"Add script {name}", body, "new-tool.md", args.push)
+
+
+def cmd_update_patch(args):
+    dest = ROOT / "patches" / args.name
+    if not dest.is_dir():
+        raise Fail(f"unknown patch '{args.name}', see: tools/contrib list")
+    files = collect_patches(args.files)
+    use_git = not args.no_git
+    branch = Branch(f"update-patch/{args.name}", use_git)
+    branch.precheck()
+    current = load_manifest(dest)
+    tested = prompt(
+        f"SwayFX version it was made against (currently {current['swayfx_tested']})",
+        latest_upstream_tag(),
+        args.tested,
+    )
+    verified = False if args.no_verify else verify(files, tested)
+    with branch:
+        if not (dest / "manifest.toml").is_file():
+            raise Fail(f"patches/{args.name} does not exist on the base branch: sync your clone or fork with upstream first")
+        branch.snapshot(dest / "manifest.toml", *dest.glob("*.patch"))
+        for old in dest.glob("*.patch"):
+            old.unlink()
+        write_series(dest, files, branch.created)
+        current["swayfx_tested"] = tested
+        (dest / "manifest.toml").write_text(dump_manifest(current))
+        regenerate_and_validate()
+        if use_git:
+            commit(["patches/" + args.name, "README.md"], f"Update patch {args.name} for {tested}")
+    print(f"updated patches/{args.name} ({len(files)} patch file(s)), tested on {tested}")
+    if not use_git:
+        print("files written, nothing committed (--no-git)")
+        return 0
+    checked = ["Update to an existing tool", "Commits are signed off", "`manifest.toml` is up to date"]
+    body = fill_template(
+        ROOT / ".github/PULL_REQUEST_TEMPLATE.md",
+        [(r"^<!-- What changes and why -->$", f"Update {args.name} for SwayFX {tested}.")],
+        checked,
+    )
+    return contribute(branch.name, f"Update patch {args.name} for {tested}", body, None, args.push)
+
+
+def cmd_adopt(args):
+    kind = None
+    for candidate in ("patches", "scripts"):
+        if (ROOT / candidate / args.name / "manifest.toml").is_file():
+            kind = candidate
+    if kind is None:
+        raise Fail(f"unknown tool '{args.name}', see: tools/contrib list")
+    dest = ROOT / kind / args.name
+    manifest = load_manifest(dest)
+    use_git = not args.no_git
+    branch = Branch(f"adopt/{args.name}", use_git)
+    branch.precheck()
+    maintainer = prompt("Your GitHub handle", git_user(), args.maintainer, check_handle).lstrip("@")
+    previous = manifest["maintainer"]
+    was_status = manifest["status"]
+    with branch:
+        if not (dest / "manifest.toml").is_file():
+            raise Fail(f"{kind}/{args.name} does not exist on the base branch: sync your clone or fork with upstream first")
+        branch.snapshot(dest / "manifest.toml")
+        manifest["maintainer"] = maintainer
+        manifest["status"] = "active"
+        (dest / "manifest.toml").write_text(dump_manifest(manifest))
+        set_codeowner(kind, args.name, maintainer)
+        regenerate_and_validate()
+        if use_git:
+            commit([f"{kind}/{args.name}", ".github/CODEOWNERS", "README.md"], f"Adopt {args.name}")
+    print(f"{args.name}: maintainer {previous} -> {maintainer}, status {was_status} -> active")
+    if not use_git:
+        print("files written, nothing committed (--no-git)")
+        return 0
+    checked = ["`manifest.toml` and `.github/CODEOWNERS` both updated"]
+    if was_status == "unmaintained":
+        checked.append("Previous maintainer approved")
+    body = fill_template(
+        ROOT / ".github/PULL_REQUEST_TEMPLATE/maintainer-change.md",
+        [
+            (r"^Tool:.*$", f"Tool: {args.name}"),
+            (r"^Previous maintainer:.*$", f"Previous maintainer: @{previous}"),
+            (r"^New maintainer:.*$", f"New maintainer: @{maintainer}"),
+        ],
+        checked,
+    )
+    return contribute(branch.name, f"Adopt {args.name}", body, "maintainer-change.md", args.push)
+
+
+def cmd_apply_patch(args):
+    series = {}
+    for name in args.names:
+        directory = ROOT / "patches" / name
+        if not NAME_RE.fullmatch(name) or not directory.is_dir():
+            raise Fail(f"unknown patch '{name}', see: tools/contrib list")
+        files = sorted(directory.glob("*.patch"))
+        if not files:
+            raise Fail(f"{name} has no .patch files")
+        series[name] = (load_manifest(directory), files)
+    if args.base == "latest":
+        base = latest_upstream_tag()
+        if not base:
+            raise Fail("could not determine the latest SwayFX tag")
+    elif args.base == "head":
+        base = None
+    elif args.base:
+        base = args.base
+    else:
+        versions = sorted({m["swayfx_tested"] for m, _ in series.values()})
+        if len(versions) != 1:
+            raise Fail(f"the patches were tested on different versions ({', '.join(versions)}): pass --base <ref>, latest or head")
+        base = versions[0]
+    dest = Path(args.dir).resolve()
+    created = not dest.exists()
+    if created:
+        print(f"cloning {UPSTREAM}")
+        run(["git", "clone", "--quiet", UPSTREAM, dest])
+    else:
+        if git(str(dest), "rev-parse", "--git-dir", check=False).returncode != 0:
+            raise Fail(f"{dest} exists and is not a git repository")
+        if git(str(dest), "status", "--porcelain").stdout.strip():
+            raise Fail(f"{dest} has uncommitted changes")
+        git(str(dest), "fetch", "--tags", "--quiet", "origin")
+    repo = str(dest)
+    branch = "contrib/" + "+".join(args.names)
+    if git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
+        raise Fail(f"branch {branch} already exists in {dest}: delete it or use another --dir")
+    abbrev = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    previous = git(repo, "rev-parse", "HEAD").stdout.strip() if abbrev == "HEAD" else abbrev
+    target = base or ("HEAD" if created else "origin/HEAD")
+    try:
+        git(repo, "switch", "--no-track", "-c", branch, target)
+        for name, (manifest, files) in series.items():
+            if manifest.get("status") != "active":
+                print(f"warning: {name} is marked {manifest.get('status')}")
+            p = run(["git", "-C", repo, "am", "--3way", *files], check=False)
+            if p.returncode != 0:
+                git(repo, "am", "--abort", check=False)
+                print((p.stderr or p.stdout).strip())
+                raise Fail(f"{name} does not apply on {base or 'upstream HEAD'} (tested on {manifest['swayfx_tested']})")
+            print(f"applied {name}")
+    except Fail:
+        if created:
+            shutil.rmtree(dest, ignore_errors=True)
+        else:
+            git(repo, "switch", *(["--detach"] if abbrev == "HEAD" else []), previous, check=False)
+            git(repo, "branch", "-D", branch, check=False)
+        print("nothing was left behind")
+        raise
+    print(f"\nready: {dest}\nbranch: {branch}\nbase: {base or 'upstream HEAD'}")
+    return 0
+
+
+def cmd_list(args):
+    rows = []
+    for kind, label in (("patches", "patch"), ("scripts", "script")):
+        base = ROOT / kind
+        if not base.is_dir():
+            continue
+        for d in sorted(p for p in base.iterdir() if p.is_dir()):
+            if (d / "manifest.toml").is_file():
+                m = load_manifest(d)
+                rows.append((label, m["name"], m["maintainer"], m["swayfx_tested"], m["status"]))
+    if not rows:
+        print("no entries")
+        return 0
+    widths = [max(len(r[i]) for r in rows) for i in range(5)]
+    for r in rows:
+        print("  ".join(r[i].ljust(widths[i]) for i in range(5)))
+    return 0
+
+
+def add_common(s, verify_flag=False):
+    s.add_argument("--no-git", action="store_true")
+    s.add_argument("--push", action="store_true")
+    if verify_flag:
+        s.add_argument("--no-verify", action="store_true")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="contrib")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("create-patch")
+    s.add_argument("files", nargs="+")
+    s.add_argument("--name")
+    s.add_argument("--description")
+    s.add_argument("--maintainer")
+    s.add_argument("--tested")
+    add_common(s, True)
+    s.set_defaults(func=cmd_create_patch)
+
+    s = sub.add_parser("create-script")
+    s.add_argument("path")
+    s.add_argument("--name")
+    s.add_argument("--description")
+    s.add_argument("--maintainer")
+    s.add_argument("--tested")
+    s.add_argument("--language")
+    s.add_argument("--depends")
+    add_common(s)
+    s.set_defaults(func=cmd_create_script)
+
+    s = sub.add_parser("update-patch")
+    s.add_argument("name")
+    s.add_argument("files", nargs="+")
+    s.add_argument("--tested")
+    add_common(s, True)
+    s.set_defaults(func=cmd_update_patch)
+
+    s = sub.add_parser("adopt")
+    s.add_argument("name")
+    s.add_argument("--maintainer")
+    add_common(s)
+    s.set_defaults(func=cmd_adopt)
+
+    s = sub.add_parser("apply-patch")
+    s.add_argument("names", nargs="+")
+    s.add_argument("--dir", default="swayfx-patched")
+    s.add_argument("--base")
+    s.set_defaults(func=cmd_apply_patch)
+
+    s = sub.add_parser("list")
+    s.set_defaults(func=cmd_list)
+
+    args = parser.parse_args()
+    try:
+        sys.exit(args.func(args))
+    except Fail as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

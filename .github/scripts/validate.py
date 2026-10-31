@@ -4,7 +4,7 @@ from pathlib import Path
 
 KINDS = {"patches": "patch", "scripts": "script"}
 REQUIRED = ["name", "description", "maintainer", "swayfx_tested", "status"]
-SCRIPT_REQUIRED = ["language", "dependencies"]
+SCRIPT_REQUIRED = ["language"]
 STATUSES = {"active", "unmaintained"}
 
 errors = []
@@ -26,6 +26,8 @@ for parent, kind in KINDS.items():
         for key in required:
             if not data.get(key):
                 errors.append(f"{manifest}: missing field {key}")
+        if kind == "script" and not isinstance(data.get("dependencies"), list):
+            errors.append(f"{manifest}: dependencies must be a list, empty if there are none")
         if data.get("name") != d.name:
             errors.append(f"{manifest}: name must equal directory name")
         if data.get("status") not in STATUSES:
