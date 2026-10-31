@@ -43,12 +43,33 @@ dependencies = ["python3"]
 - The series must apply with `git am --3way` onto `swayfx_tested`.
 - Name files `0001-*.patch`, `0002-*.patch`, in order.
 
+## Local setup
+
+Enable the repository hook once per clone. It regenerates and stages the README index on every commit:
+
+```
+git config core.hooksPath .githooks
+```
+
+Requires Python 3.11 or newer. Never edit the table between the index markers by hand.
+
 ## Pull requests
 
 - New tools and patches always get human review.
 - The maintainer of a tool can change their own directory without review. A workflow approves and auto-merges a PR when all changed files lie inside directories whose maintainer (read from the base branch) is the PR author and all required checks pass.
 - Anything else needs review: changes to `manifest.toml`, to another maintainer's directory, or to files outside `patches/<name>/` and `scripts/<name>/`.
 - Changing the maintainer of a tool is done by a PR that also edits `manifest.toml` and `.github/CODEOWNERS`. The previous maintainer or a repository owner must approve it, unless the tool is unmaintained.
+
+## Bot labels
+
+When a PR cannot be auto-merged, the bot comments with the reasons and applies labels:
+
+- `NEW`: adds a new patch or script
+- `nCO`: changes files outside a single tool directory (not content)
+- `nAUTH`: the author is not the maintainer of the touched tool
+- `MANIFEST`: changes a `manifest.toml`
+
+Labels and the comment are updated on every push. If the PR later qualifies, the labels are removed and auto-merge is enabled.
 
 ## Required checks
 
