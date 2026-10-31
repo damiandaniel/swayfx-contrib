@@ -58,14 +58,18 @@ Requires Python 3.11 or newer. Never edit the table between the index markers by
 `tools/contrib` creates tools in the correct structure, puts them on their own branch, and helps open the pull request. It needs Python 3.11 or newer and git. `origin` must be a repository you can push to, normally your fork.
 
 ```
+tools/contrib
 tools/contrib create-patch <patch files or directory>
 tools/contrib create-script <file or directory>
 tools/contrib update-patch <name> <patch files or directory>
 tools/contrib adopt <name>
+tools/contrib change
 tools/contrib apply-patch <name>...
 tools/contrib list
 ```
 
+- Without arguments (or as `tools/contrib pr`) it shows a menu of pull request presets: new patch, new script, update a patch, adopt a tool, other change. Each preset asks for what it needs and fills in the matching PR template.
+- `change` is the "other change" preset: it commits what you edited in the working tree (docs, configs, workflows, tooling) on a new branch and offers to open the PR. `--title`, `--summary`, `--branch`, and `--yes` skip the questions.
 - `create-patch` and `create-script` ask for name, description, maintainer, SwayFX version (and language and dependencies for scripts), each on its own line. Every answer can also be passed as an option, for example `--name` or `--description`.
 - They create `patches/<name>` or `scripts/<name>` with `manifest.toml` and `README.md`, add the `CODEOWNERS` entry, regenerate and validate the index, and commit with a sign-off on a new branch (`add-patch/<name>`, `add-script/<name>`). Then they offer to push and open the pull request, with the template already filled in. Use `--push` to skip the question and `--no-git` to only write files.
 - Patches must be made with `git format-patch` from signed-off commits. `create-patch` checks this and verifies that the series applies on the SwayFX version you name. Use `--no-verify` to skip the apply check.
