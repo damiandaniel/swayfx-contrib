@@ -25,7 +25,7 @@ This repository is not covered by upstream support. Report problems here, not in
 ## Using a patch
 
 ```
-git clone <swayfx-url> && cd swayfx
+git clone https://github.com/wlrfx/swayfx && cd swayfx
 git checkout <tag from the patch manifest>
 git am --3way /path/to/swayfx-contrib/patches/<name>/*.patch
 ```
