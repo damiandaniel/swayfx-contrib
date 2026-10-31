@@ -1,0 +1,25 @@
+name: Bug in a tool or patch
+description: Report a problem with something in this repository
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool or patch name
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: SwayFX version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce

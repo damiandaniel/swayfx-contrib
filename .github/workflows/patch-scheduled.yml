@@ -1,0 +1,31 @@
+name: patch-scheduled
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+env:
+  SWAYFX_URL: https://github.com/wlrfx/swayfx
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check all patches
+        run: |
+          bash .github/scripts/check_patches.sh tag || true
+          bash .github/scripts/check_patches.sh head || true
+      - name: Report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat failed-tag.txt failed-head.txt | sort -u | while read -r name; do
+            [ -n "$name" ] || continue
+            title="Patch no longer applies: $name"
+            existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+            [ -z "$existing" ] || continue
+            maintainer=$(python3 -c "import tomllib; print(tomllib.load(open('patches/$name/manifest.toml','rb'))['maintainer'])")
+            gh issue create --title "$title" --body "@$maintainer the patch series $name fails to apply on the latest SwayFX tag or the default branch. See CONTRIBUTING.md for the lifecycle."
+          done

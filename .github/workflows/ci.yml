@@ -1,0 +1,56 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+env:
+  SWAYFX_URL: https://github.com/wlrfx/swayfx
+jobs:
+  reuse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install reuse
+      - run: reuse lint
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 .github/scripts/validate.py
+      - run: python3 .github/scripts/generate_index.py --check
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          files=$(git ls-files '*.sh')
+          [ -z "$files" ] || shellcheck $files
+  patch-apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Determine touched patches
+        id: names
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            names=$(git diff --name-only "$BASE_SHA"...HEAD | sed -n 's#^patches/\([^/]*\)/.*#\1#p' | sort -u | tr '\n' ' ')
+          else
+            names=""
+          fi
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+      - name: Apply on latest tag
+        if: steps.names.outputs.names != ''
+        env:
+          NAMES: ${{ steps.names.outputs.names }}
+        run: bash .github/scripts/check_patches.sh tag $NAMES
+      - name: Apply on default branch
+        if: steps.names.outputs.names != ''
+        env:
+          NAMES: ${{ steps.names.outputs.names }}
+        run: bash .github/scripts/check_patches.sh head $NAMES

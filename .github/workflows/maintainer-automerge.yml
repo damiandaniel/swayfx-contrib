@@ -1,0 +1,47 @@
+name: maintainer-automerge
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  evaluate:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)')
+          declare -A dirs=()
+          ok=1
+          while IFS= read -r f; do
+            if [[ "$f" =~ ^(patches|scripts)/([^/]+)/(.+)$ ]] \
+               && [[ "${BASH_REMATCH[3]}" != "manifest.toml" ]]; then
+              dirs["${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"]=1
+            else
+              ok=0
+            fi
+          done <<< "$files"
+          [ "${#dirs[@]}" -gt 0 ] || ok=0
+          for d in "${!dirs[@]}"; do
+            maint=$(gh api "repos/$REPO/contents/$d/manifest.toml?ref=$BASE" --jq .content 2>/dev/null \
+              | base64 -d \
+              | python3 -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read()).get("maintainer",""))' \
+              2>/dev/null || true)
+            if [ -z "$maint" ] || [ "${maint,,}" != "${AUTHOR,,}" ]; then
+              ok=0
+            fi
+          done
+          if [ "$ok" -eq 1 ]; then
+            gh pr review "$PR" --repo "$REPO" --approve
+            gh pr merge "$PR" --repo "$REPO" --auto --squash
+          fi

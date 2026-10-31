@@ -1,0 +1,15 @@
+name: Adopt an unmaintained tool
+description: Offer to maintain a tool marked unmaintained
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool or patch name
+    validations:
+      required: true
+  - type: textarea
+    id: plan
+    attributes:
+      label: How you will keep it current
+    validations:
+      required: true
