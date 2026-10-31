@@ -214,7 +214,10 @@ class Branch:
 
 
 def commit(paths, message):
-    rgit("add", "--", *paths)
+    if paths == ["-A"]:
+        rgit("add", "-A")
+    else:
+        rgit("add", "--", *paths)
     run(["git", "-C", ROOT, "commit", "-s", "-q", "-m", message])
     return rgit("rev-parse", "--short", "HEAD").stdout.strip()
 
@@ -648,6 +651,134 @@ def cmd_list(args):
     return 0
 
 
+def cmd_change(args):
+    if rgit("rev-parse", "--git-dir", check=False).returncode != 0:
+        raise Fail("not a git repository")
+    status = rgit("status", "--porcelain").stdout.rstrip()
+    if not status:
+        raise Fail("no changes to contribute: edit or add files first")
+    print("changes found:\n" + status + "\n")
+    if re.search(r"^.. (patches|scripts)/", status, re.M):
+        print("note: these include tool content. Use create-patch, create-script or update-patch for that, and keep other changes in a separate PR.\n")
+    title = prompt("Title", None, args.title)
+    summary = prompt("Summary (what and why, one line)", None, args.summary)
+
+    def check_branch(value):
+        if run(["git", "check-ref-format", "--branch", value], check=False).returncode != 0:
+            raise Fail("not a valid branch name")
+        if rgit("rev-parse", "--verify", "--quiet", f"refs/heads/{value}", check=False).returncode == 0:
+            raise Fail(f"branch {value} already exists")
+
+    default_branch_name = "change/" + slugify(title)
+    given_branch = args.branch if args.branch is not None else (default_branch_name if args.yes else None)
+    branch = prompt("Branch name", default_branch_name, given_branch, check_branch)
+    if not args.yes and not confirm("Commit all of these changes to that branch?"):
+        print("nothing done")
+        return 0
+    abbrev = rgit("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    sha = rgit("rev-parse", "HEAD").stdout.strip()
+    previous = sha if abbrev == "HEAD" else abbrev
+    rgit("switch", "-c", branch)
+    try:
+        commit(["-A"], f"{title}\n\n{summary}")
+    except Fail:
+        rgit("switch", *(["--detach"] if abbrev == "HEAD" else []), previous, check=False)
+        rgit("branch", "-D", branch, check=False)
+        raise
+    body = fill_template(
+        ROOT / ".github/PULL_REQUEST_TEMPLATE.md",
+        [(r"^<!-- What changes and why -->$", summary)],
+        ["Other (docs", "Commits are signed off"],
+    )
+    return contribute(branch, title, body, None, args.push)
+
+
+NS_DEFAULTS = dict(
+    name=None, description=None, maintainer=None, tested=None, language=None, depends=None,
+    no_git=False, push=False, no_verify=False, title=None, summary=None, branch=None, yes=False,
+)
+
+
+def ns(**kw):
+    return argparse.Namespace(**{**NS_DEFAULTS, **kw})
+
+
+def choose(title, options):
+    print(title + "\n")
+    width = max(len(label) for label, _ in options)
+    for i, (label, desc) in enumerate(options, 1):
+        print(f"  {i}) {label.ljust(width)}  {desc}")
+    print("  q) Quit\n")
+    while True:
+        try:
+            raw = input("Choice: ").strip().lower()
+        except EOFError:
+            raise Fail("a terminal is needed to choose from the menu")
+        if raw in ("q", "quit"):
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+        print("enter a number from the list, or q")
+
+
+def tool_rows(kinds, status=None):
+    labels = {"patches": "patch", "scripts": "script"}
+    rows = []
+    for kind in kinds:
+        base = ROOT / kind
+        if not base.is_dir():
+            continue
+        for d in sorted(p for p in base.iterdir() if p.is_dir()):
+            if not (d / "manifest.toml").is_file():
+                continue
+            m = load_manifest(d)
+            if status and m["status"] != status:
+                continue
+            rows.append((m["name"], f"{labels[kind]}, {m['maintainer']}, tested on {m['swayfx_tested']}, {m['status']}"))
+    return rows
+
+
+def ask_path(label):
+    return prompt(label).strip("'\"")
+
+
+def cmd_menu(args):
+    presets = [
+        ("New patch", "add a git format-patch series for SwayFX"),
+        ("New script", "add an IPC script or helper"),
+        ("Update a patch", "new patch files or a new SwayFX version for an existing patch"),
+        ("Adopt a tool", "take over an unmaintained patch or script"),
+        ("Other change", "docs, configs, workflows or tooling: commit what you changed in the working tree"),
+    ]
+    picked = choose("What do you want to contribute?", presets)
+    if picked is None:
+        return 0
+    print()
+    if picked == 0:
+        return cmd_create_patch(ns(files=[ask_path("Path to the patch file or directory")]))
+    if picked == 1:
+        return cmd_create_script(ns(path=ask_path("Path to the script file or directory")))
+    if picked == 2:
+        rows = tool_rows(("patches",))
+        if not rows:
+            raise Fail("there are no patches yet")
+        i = choose("Which patch?", rows)
+        if i is None:
+            return 0
+        print()
+        return cmd_update_patch(ns(name=rows[i][0], files=[ask_path("Path to the new patch file or directory")]))
+    if picked == 3:
+        rows = tool_rows(("patches", "scripts"), "unmaintained")
+        if not rows:
+            raise Fail("there are no unmaintained tools")
+        i = choose("Which tool?", rows)
+        if i is None:
+            return 0
+        print()
+        return cmd_adopt(ns(name=rows[i][0]))
+    return cmd_change(ns())
+
+
 def add_common(s, verify_flag=False):
     s.add_argument("--no-git", action="store_true")
     s.add_argument("--push", action="store_true")
@@ -657,7 +788,18 @@ def add_common(s, verify_flag=False):
 
 def main():
     parser = argparse.ArgumentParser(prog="contrib")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("pr")
+    s.set_defaults(func=cmd_menu)
+
+    s = sub.add_parser("change")
+    s.add_argument("--title")
+    s.add_argument("--summary")
+    s.add_argument("--branch")
+    s.add_argument("--yes", action="store_true")
+    s.add_argument("--push", action="store_true")
+    s.set_defaults(func=cmd_change)
 
     s = sub.add_parser("create-patch")
     s.add_argument("files", nargs="+")
@@ -702,6 +844,8 @@ def main():
     s.set_defaults(func=cmd_list)
 
     args = parser.parse_args()
+    if args.cmd is None:
+        args.func = cmd_menu
     try:
         sys.exit(args.func(args))
     except Fail as e:
