@@ -19,7 +19,7 @@ This repository is not covered by upstream support. Report problems here, not in
 <!-- index:start -->
 | Name | Type | Description | Maintainer | Tested on | Status |
 | --- | --- | --- | --- | --- | --- |
-| [test-patch](patches/test-patch) | patche | Dummy patch for testing the repository automation. | @damiandaniel | 0.6 | active |
+| [test-patch](patches/test-patch) | patch | Dummy patch for testing the repository automation. | @damiandaniel | 0.6 | active |
 <!-- index:end -->
 
 ## Using a patch
